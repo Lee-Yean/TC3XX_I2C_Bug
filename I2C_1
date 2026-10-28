@@ -1,0 +1,195 @@
+
+IfxI2c_I2c_Status IfxI2c_I2c_write(IfxI2c_I2c_Device *i2cDevice, volatile uint8 *data, Ifx_SizeT size)
+{
+    IfxI2c_I2c_Status  status    = IfxI2c_I2c_Status_ok;
+    Ifx_I2C           *i2c       = i2cDevice->i2c->i2c;
+    uint16             addr       = i2cDevice->deviceAddress;
+    uint16             slAddr;
+    IfxI2c_AddressMode addressMode= i2cDevice->addressMode;
+
+    union data
+    {
+        uint32 packet;
+        uint8  packetbyte[4];
+    } txdata;
+
+    sint32 bytesToSend = size + 1; // +1 slave device address
+    uint32 bytes;
+
+    if (IfxI2c_busIsFree(i2c) == FALSE)
+    {
+        status                      = IfxI2c_I2c_Status_busNotFree;
+        i2cDevice->i2c->busStatus   = IfxI2c_getBusStatus(i2c);
+        i2cDevice->i2c->status      = status;
+        return status;
+    }
+
+    // build one packet containing the slave address
+    IfxI2c_clearAllProtocolInterruptSources(i2c);
+    IfxI2c_clearAllErrorInterruptSources(i2c);
+
+    /* switch to highspeed mode if needed */
+    if (i2cDevice->speedMode == IfxI2c_Mode_HighSpeed)
+    {
+        IfxI2c_setTransmitPacketSize(i2c, 1);
+        IfxI2c_writeFifo(i2c, IFXI2C_HIGHSPEED_MASTER_CODE); // Send the Master code to switch to high speed mode
+
+        // wait until packet is sent
+        while (IfxI2c_getProtocolInterruptSourceStatus(i2c, IfxI2c_ProtocolInterruptSource_transmissionEnd) == FALSE)
+        {
+        }
+
+        // check status
+        if (IfxI2c_getProtocolInterruptSourceStatus(i2c, IfxI2c_ProtocolInterruptSource_notAcknowledgeReceived) == FALSE)
+        {
+            // the MASTER_CODE should not be responded, must be always shows a NAK
+            IfxI2c_clearAllProtocolInterruptSources(i2c);
+            status                      = IfxI2c_I2c_Status_error;
+            IfxI2c_releaseBus(i2c);
+            i2cDevice->i2c->busStatus   = IfxI2c_getBusStatus(i2c);
+            i2cDevice->i2c->status      = status;
+            return status;
+        }
+
+        IfxI2c_clearAllProtocolInterruptSources(i2c);
+        IfxI2c_clearAllDtrInterruptSources(i2c);
+    }
+
+    // try to seize control, if not return
+    if (addressMode == IfxI2c_AddressMode_10Bit)
+    {
+        /* for 10 bit slave address */
+        slAddr = (uint16)((0xF000) | ((addr & 0x3 << 8) << 9) | (~(1 << 8)) | (addr & 0xFF));
+    }
+    else
+    {
+        /* for 7 bit slave address */
+        slAddr = (uint16)(addr & 0xfe);
+    }
+
+    if (size > 0) // write i2c device
+    {
+        uint32  i, j = 0;
+
+        // assumes TC is faster then i2c and therefor a fifo underflow is not possible
+        boolean intEnabled = IfxCpu_disableInterrupts(); // disable global interrupts to prevent FIFO underflow
+        IfxI2c_setTransmitPacketSize(i2c, size + 1);
+
+        for (i = 0; i < (uint32)(size + 1); i += 4)
+        {
+            if (bytesToSend >= 4)
+            {
+                bytes        = 4;
+                bytesToSend -= 4;
+            }
+            else
+            {
+                bytes        = bytesToSend;
+                bytesToSend  = 0;
+            }
+
+            txdata.packet = 0;
+
+            for (j = 0; j < bytes; j++)
+            {
+                if (addressMode == IfxI2c_AddressMode_10Bit)
+                {
+                    if ((i == 0) && (j < 2))
+                    {
+                        if (j == 0)
+                        {
+                            txdata.packetbyte[j] = (uint8)((slAddr & 0xff00) >> 8);
+                        }
+                        else
+                        {
+                            txdata.packetbyte[j] = (uint8)(slAddr & 0x00ff);
+                        }
+                    }
+                    else
+                    {
+                        txdata.packetbyte[j] = (uint8)data[i + j - 1];
+                    }
+                }
+                else
+                {
+                    if ((i == 0) && (j == 0))
+                    {
+                        txdata.packetbyte[j] = (uint8)slAddr;
+                    }
+                    else
+                    {
+                        txdata.packetbyte[j] = (uint8)data[i + j - 1];
+                    }
+                }
+            }
+
+            do
+            {
+                // check errors
+                uint32 ris;
+                ris = i2c->RIS.U;
+
+                if (ris & (1 << IFX_I2C_RIS_I2C_P_INT_OFF)) // check protocol flags
+                {
+                    IfxI2c_clearAllProtocolInterruptSources(i2c);
+                    status = IfxI2c_I2c_Status_error;
+                }
+
+                if (ris & (1 << IFX_I2C_RIS_I2C_ERR_INT_OFF)) // error flags
+                {
+                    IfxI2c_clearAllErrorInterruptSources(i2c);
+                    status = IfxI2c_I2c_Status_error;
+                }
+
+            } while (i2c->FFSSTAT.B.FFS == 8 && status != IfxI2c_I2c_Status_error); // wait to prevent FIFO overflow
+
+            if (status == IfxI2c_I2c_Status_error)
+            {
+                break;
+            }
+
+            IfxI2c_writeFifo(i2c, txdata.packet);
+            IfxI2c_clearAllDtrInterruptSources(i2c);
+        }
+
+        IfxCpu_restoreInterrupts(intEnabled); // (re-) enable global interrupts
+
+        // wait until all bytes are sent
+        while (IfxI2c_getProtocolInterruptSourceStatus(i2c, IfxI2c_ProtocolInterruptSource_transmissionEnd) == FALSE)
+        {
+        }
+        IfxI2c_clearProtocolInterruptSource(i2c, IfxI2c_ProtocolInterruptSource_transmissionEnd);
+
+        // finally check errors
+        uint32 ris;
+        ris = i2c->RIS.U;
+
+        if (ris & (1 << IFX_I2C_RIS_I2C_P_INT_OFF)) // check protocol flags
+        {
+            IfxI2c_clearAllProtocolInterruptSources(i2c);
+            status = IfxI2c_I2c_Status_error;
+        }
+        if (ris & (1 << IFX_I2C_RIS_I2C_ERR_INT_OFF)) // error flags
+        {
+            IfxI2c_clearAllErrorInterruptSources(i2c);
+            status = IfxI2c_I2c_Status_error;
+        }
+    }
+
+    if (!i2cDevice->enableRepeatedStart)
+    {
+        IfxI2c_releaseBus(i2c);
+    }
+    else
+    {
+        //wait until bus is free
+        while (IfxI2c_getProtocolInterruptSourceStatus(i2c, IfxI2c_ProtocolInterruptSource_transmissionEnd) == FALSE)
+        {
+        }
+        IfxI2c_clearProtocolInterruptSource(i2c, IfxI2c_ProtocolInterruptSource_transmissionEnd);
+    }
+
+    i2cDevice->i2c->busStatus = IfxI2c_getBusStatus(i2c);
+    i2cDevice->i2c->status    = status;
+    return status;
+}
